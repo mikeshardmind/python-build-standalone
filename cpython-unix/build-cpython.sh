@@ -355,8 +355,12 @@ if [ -n "${CPYTHON_DEBUG}" ]; then
     CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --with-pydebug"
 fi
 
+if [ -n "${PYTHON_MEETS_MINIMUM_VERSION_3_13}" ]; then
+    CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --with-mimalloc"
+fi
+
 if [ -n "${CPYTHON_FREETHREADED}" ]; then
-    CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --disable-gil --with-mimalloc"
+    CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --disable-gil"
 fi
 
 if [ -n "${CPYTHON_OPTIMIZED}" ]; then
