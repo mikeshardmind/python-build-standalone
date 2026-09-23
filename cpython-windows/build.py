@@ -94,7 +94,7 @@ CONVERT_TO_BUILTIN_EXTENSIONS = {
         "shared_depends_win32": ["libcrypto-1_1", "libssl-1_1"],
     },
     "_tkinter": {
-        "shared_depends": ["tcl86t", "tk86t"],
+        "ignore_additional_depends": {"$(tcltkLib)"},
     },
     "_queue": {},
     "_uuid": {"ignore_missing": True},
@@ -131,7 +131,7 @@ EXTENSION_TO_LIBRARY_DOWNLOADS_ENTRY = {
     "_lzma": ["xz"],
     "_sqlite3": ["sqlite"],
     "_ssl": ["openssl"],
-    "_tkinter": ["tcl-8612", "tk-8612", "tix"],
+    "_tkinter": ["tcltk", "tix"],
     "_uuid": ["uuid"],
     "zlib": ["zlib"],
     "_zstd": ["zstd"],
@@ -421,8 +421,8 @@ def hack_props(
     td: pathlib.Path,
     pcbuild_path: pathlib.Path,
     arch: str,
-    python_version: str,
     zlib_entry: str,
+    tk_bin_entry: str,
 ):
     # TODO can we pass props into msbuild.exe?
 
@@ -437,12 +437,7 @@ def hack_props(
 
     mpdecimal_version = DOWNLOADS["mpdecimal"]["version"]
 
-    if meets_python_minimum_version(python_version, "3.14"):
-        tcltk_commit = DOWNLOADS["tk-windows-bin-904"]["git_commit"]
-    elif arch == "arm64":
-        tcltk_commit = DOWNLOADS["tk-windows-bin-8614"]["git_commit"]
-    else:
-        tcltk_commit = DOWNLOADS["tk-windows-bin-8612"]["git_commit"]
+    tcltk_commit = DOWNLOADS[tk_bin_entry]["git_commit"]
 
     sqlite_path = td / f"sqlite-autoconf-{sqlite_version}"
     bzip2_path = td / f"bzip2-{bzip2_version}"
@@ -576,7 +571,7 @@ def hack_project_files(
     build_directory: str,
     python_version: str,
     zlib_entry: str,
-    arch: str,
+    tk_bin_entry: str,
 ):
     """Hacks Visual Studio project files to work with our build."""
 
@@ -586,8 +581,8 @@ def hack_project_files(
         td,
         pcbuild_path,
         build_directory,
-        python_version,
         zlib_entry,
+        tk_bin_entry,
     )
 
     # `--include-tcltk` is forced off on arm64, undo that
@@ -729,22 +724,13 @@ def hack_project_files(
             rb'<ClCompile Include="$(opensslIncludeDir)\openssl\applink.c">',
         )
 
-    # Python 3.12+ uses the the pre-built tk-windows-bin 8.6.12 which doesn't
-    # have a standalone zlib DLL, so we remove references to it. For Python
-    # 3.14+, we're using tk-windows-bin 9.0.4 which includes a prebuilt zlib
-    # DLL, so we skip this patch there.
-    # On arm64, we use the new version of tk-windows-bin for all versions.
-    if meets_python_minimum_version(python_version, "3.12") and (
-        meets_python_maximum_version(python_version, "3.13") or arch == "arm64"
-    ):
-        try:
-            static_replace_in_file(
-                pcbuild_path / "_tkinter.vcxproj",
-                rb'<_TclTkDLL Include="$(tcltkdir)\bin\$(tclZlibDllName)" />',
-                rb"",
-            )
-        except NoSearchStringError:
-            pass
+        # Older project files do not copy the newer Tcl/Tk bundle's zlib DLL.
+        static_replace_in_file(
+            pcbuild_path / "_tkinter.vcxproj",
+            rb'<_TclTkDLL Include="$(tcltkdir)\bin\$(tkDllName)" />',
+            rb'<_TclTkDLL Include="$(tcltkdir)\bin\$(tkDllName)" />'
+            b'\r\n    <_TclTkDLL Include="$(tcltkdir)\\bin\\zlib1.dll" />',
+        )
 
     # We don't need to produce python_uwp.exe and its *w variant. Or the
     # python3.dll, pyshellext, or pylauncher.
@@ -1129,6 +1115,8 @@ def collect_python_build_artifacts(
     openssl_entry: str,
     zlib_entry: str,
     freethreaded: bool,
+    tk_bin_entry: str,
+    tcltk_dlls: list[str],
 ):
     """Collect build artifacts from Python.
     Copies them into an output directory and returns a data structure describing
@@ -1341,6 +1329,12 @@ def collect_python_build_artifacts(
             "variant": "default",
         }
 
+        if ext == "_tkinter":
+            entry["links"].extend(
+                {"name": name, "path_dynamic": f"install/DLLs/{name}.dll"}
+                for name in tcltk_dlls
+            )
+
         for obj in process_project(ext, dest_dir):
             entry["objs"].append(f"build/extensions/{ext}/{obj}")
 
@@ -1368,9 +1362,12 @@ def collect_python_build_artifacts(
                 if name == "zlib":
                     name = zlib_entry
 
-                # On 3.14+ and aarch64, we use the latest tcl/tk version
-                if ext == "_tkinter" and (python_majmin == "314" or arch == "arm64"):
-                    name = name.replace("-8612", "")
+                if name == "tcltk":
+                    name = tk_bin_entry
+
+                # Tix is only included in the Tcl/Tk 8.6 bundle.
+                if name == "tix" and int(python_majmin) >= 314:
+                    continue
 
                 download_entry = DOWNLOADS[name]
 
@@ -1415,6 +1412,29 @@ def collect_python_build_artifacts(
     return res
 
 
+def install_tcltk(tcltk_dir: pathlib.Path, install_dir: pathlib.Path):
+    """Install the selected bundle's runtime DLLs and Tcl package directories."""
+    dlls = sorted((tcltk_dir / "bin").glob("*.dll"))
+    if not dlls:
+        raise FileNotFoundError(f"No Tcl/Tk DLLs found in {tcltk_dir}")
+
+    dll_dir = install_dir / "DLLs"
+    dll_dir.mkdir(parents=True, exist_ok=True)
+    for source in dlls:
+        log(f"copying {source} to {dll_dir}")
+        shutil.copy2(source, dll_dir / source.name)
+
+    library_paths = []
+    for source in sorted((tcltk_dir / "lib").iterdir()):
+        if source.is_dir() and source.name != "nmake":
+            dest = install_dir / "tcl" / source.name
+            log(f"copying {source} to {dest}")
+            shutil.copytree(source, dest, dirs_exist_ok=True)
+            library_paths.append(source.name)
+
+    return [path.stem for path in dlls], library_paths
+
+
 def build_cpython(
     python_entry_name: str,
     target_triple: str,
@@ -1456,17 +1476,11 @@ def build_cpython(
     setuptools_wheel = download_entry("setuptools", BUILD)
     pip_wheel = download_entry("pip", BUILD)
 
-    # We use a prebuild tcl/tk from the upstream CPython project.
-    # Tcl/tk 8.6.14+ has an additional runtime dependency. We are conservative and
-    # use an old version prior to CPython 3.14. The older tck/tk release
-    # is not available for arm64 so we use a newer release there as well.
-    # On CPython 3.14+ we match the version included in the Python.org release.
+    # Use upstream CPython's prebuilt bundles, retaining Tcl/Tk 8.6 before 3.14.
     if meets_python_minimum_version(python_version, "3.14"):
         tk_bin_entry = "tk-windows-bin-904"
-    elif arch == "arm64":
-        tk_bin_entry = "tk-windows-bin-8614"
     else:
-        tk_bin_entry = "tk-windows-bin-8612"
+        tk_bin_entry = "tk-windows-bin-8615"
     tk_bin_archive = download_entry(
         tk_bin_entry, BUILD, local_name="tk-windows-bin.tar.gz"
     )
@@ -1578,16 +1592,15 @@ def build_cpython(
             shutil.copyfile(source, dest)
 
         # Delete the tk nmake helper, it's not needed and links msvc
-        if tk_bin_entry in ("tk-windows-bin-8614", "tk-windows-bin-904"):
-            tcltk_commit: str = DOWNLOADS[tk_bin_entry]["git_commit"]
-            tcltk_path = td / f"cpython-bin-deps-{tcltk_commit}"
-            (
-                tcltk_path
-                / build_directory
-                / "lib"
-                / "nmake"
-                / "x86_64-w64-mingw32-nmakehlp.exe"
-            ).unlink()
+        tcltk_commit = DOWNLOADS[tk_bin_entry]["git_commit"]
+        tcltk_path = td / f"cpython-bin-deps-{tcltk_commit}"
+        (
+            tcltk_path
+            / build_directory
+            / "lib"
+            / "nmake"
+            / "x86_64-w64-mingw32-nmakehlp.exe"
+        ).unlink()
 
         cpython_source_path = td / f"Python-{python_version}"
         pcbuild_path = cpython_source_path / "PCbuild"
@@ -1611,7 +1624,7 @@ def build_cpython(
             build_directory,
             python_version=python_version,
             zlib_entry=zlib_entry,
-            arch=arch,
+            tk_bin_entry=tk_bin_entry,
         )
 
         if pgo:
@@ -1760,6 +1773,12 @@ def build_cpython(
             os.environ,
         )
 
+        # PC/layout omits unsuffixed Tcl/Tk DLLs in debug builds and misses
+        # Tcl 9 package directories when its core scripts are embedded in DLLs.
+        tcltk_dlls, tcl_library_paths = install_tcltk(
+            tcltk_path / build_directory, install_dir
+        )
+
         # We install pip by using pip to install itself. This leverages a feature
         # where Python can automatically recognize wheel/zip files on sys.path and
         # import their contents. According to
@@ -1826,6 +1845,8 @@ def build_cpython(
             openssl_entry=openssl_entry,
             zlib_entry=zlib_entry,
             freethreaded=freethreaded,
+            tk_bin_entry=tk_bin_entry,
+            tcltk_dlls=tcltk_dlls,
         )
 
         for ext, init_fn in sorted(builtin_extensions.items()):
@@ -1939,14 +1960,7 @@ def build_cpython(
         python_info.update(metadata)
 
         python_info["tcl_library_path"] = "install/tcl"
-        python_info["tcl_library_paths"] = [
-            "dde1.4",
-            "reg1.3",
-            "tcl8.6",
-            "tk8.6",
-            "tcl8",
-            "tix8.4.3",
-        ]
+        python_info["tcl_library_paths"] = tcl_library_paths
 
         validate_python_json(python_info, extension_modules=None)
 
